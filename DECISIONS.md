@@ -2,6 +2,27 @@
 
 > 你在休息，我把所有能自己判断的都做完了。这里只记**真正需要你拍板**的，每条都写了我的默认选择和理由，你回来只需看「要不要改」。
 
+## ⚠️ 唯一需要你动手的一件事：推送代码
+
+代码已完整提交到本地 `main`（commit `6b24c07`，39 个文件，18066 行），但**推送到 GitHub 失败**。
+
+**原因**：`git config credential.helper = manager`，推送时 Git 要弹 GUI 凭据窗口，在非交互环境下阻塞超时。这是环境限制，不是代码问题。
+
+**你需要做的**（任选其一）：
+
+```bash
+# 方式一：在桌面终端里直接推（会弹窗让你登录）
+cd D:/CodeSpace/DSH-AgentMesh/dsh-agent-mesh
+git push -u origin main
+
+# 方式二：用 token
+git push https://<你的token>@github.com/daiki-ver/dsh-agent-mesh.git main
+```
+
+推完 `git log --oneline -1` 应看到 `6b24c07 feat: Mesh bundle — ...`。
+
+---
+
 ## 状态速览
 
 **已完成并实测通过**（不是"写完了"，是真跑起来了）：
