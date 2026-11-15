@@ -1,0 +1,155 @@
+# dsh-agent-mesh bundle layer.
+#
+# This file MUST be a single-element array whose element is `{insert: [...]}`.
+# A top-level row without `insert` is read as a patch targeting an existing row id;
+# in a fresh profile that id does not exist, so the Loader warns and SKIPS it —
+# silently, without failing the boot. Every row below therefore lives under `insert`.
+#
+# Verify after installing:
+#   dsh --profile mesh --dump-config | grep -c mesh-engine        # must be >= 1
+#   dsh --profile mesh --dump-config 2>&1 >/dev/null | grep -i "unknown\|skipped"   # must be empty
+- insert:
+    # ── Engine: the whole state machine, message bus, budget ledger, and worker
+    #    executor. A root-level plugin, so its `session/event` listener is untagged
+    #    and therefore receives events from every Session in the process.
+    - id: mesh-engine
+      name: dsh-agent-mesh
+      config:
+        stateDir: ~/.dsh/state/mesh
+        pass:
+          intervalMs: 2000
+        executor:
+          residentWorkers: 2
+          tempSlots: 2
+          prepareTimeoutMs: 600000
+        budget:
+          coalitionSoft: 0.8
+        coalitions:
+          inferredBlocking: false
+        eval:
+          model: null
+          timeoutMs: 300000
+        watchdog:
+          enabled: true
+          everySeconds: 3600
+
+    # ── Preset: the Router. Deliberately WITHOUT a shell, subagents, web, or file
+    #    writes. This is a deviation from the superagent prototype, whose Router keeps
+    #    a full shell; see README "Why the Router has no shell". Do not "fix" it.
+    - id: mesh-router-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: mesh-router
+        name: Mesh Router
+        description: Mesh 的调度面，不供手动选择。无 shell、无文件写，只含路由与评估工具。
+        order: 90
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are the Router of a mesh of coding agents. You route, assess, and arbitrate; you never do the work yourself.'
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+
+    # ── Preset: every Worker. One shared platform preset; per-kind differences come
+    #    from runtime permission presets and the role prompt, not from separate
+    #    presets. A preset row is a hard dependency of resuming a persisted Session,
+    #    so keep this list short and never delete the row.
+    #
+    #    Group rows use `name: cordis:group` with a `config:` child list. The children
+    #    are the real plugins: `@deepseek-ai/dsh-shell` and `@deepseek-ai/dsh-compaction`
+    #    are SERVICES, and mounting only them yields a worker with no shell and no
+    #    compaction.
+    - id: mesh-worker-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: mesh-worker
+        name: Mesh Worker
+        description: Mesh 的执行器 Session 专用，不供手动选择。前台命令超 5 秒转入后台。
+        order: 91
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a coding agent powered by the {{model}} model.'
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: shell
+            name: cordis:group
+            group: true
+            isolate:
+              shell: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+              - id: pwsh-sandbox
+                name: '@deepseek-ai/dsh-pwsh-sandbox'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+              - id: tool-bash
+                name: '@deepseek-ai/dsh-tool-bash'
+                disabled: !!js process.platform === 'win32'
+              - id: tool-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh'
+                disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              # Required, not defaulted: the Host refuses to mount this plugin without it.
+              # Keeping over-cap glob results as a sample is the cheap choice.
+              sampleOverCapGlobResults: true
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+            config:
+              waitTimeoutMs: 5000
+              maxWaitTimeoutMs: 5000
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              # Required, not defaulted. One ticket is one thread of work, so a worker
+              # doing two things at once is a sign the ticket was too broad.
+              allowParallelInProgress: false
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
