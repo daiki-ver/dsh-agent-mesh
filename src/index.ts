@@ -30,7 +30,8 @@ import { newId, now, type Worker, type WorkerKind } from './core/model.ts'
 import { WORKER_TEMPLATES } from './core/directory.ts'
 
 import {
-  REQUIRED_SERVICES, residentSessionId, type HostServices, type ScheduleService,
+  REQUIRED_SERVICES, routerSessionId, workspaceScope,
+  type HostServices, type ScheduleService,
   type SessionEvent, type TokenMeterService, type SessionId,
 } from './app/host.ts'
 import { SessionManager } from './app/sessions.ts'
@@ -49,11 +50,24 @@ export const name = 'dsh-agent-mesh'
 /** How often the pass loop wakes up. A fallback beat, never a correctness guarantee. */
 export const DEFAULT_PASS_INTERVAL_MS = 2000
 
-/** The Router's Session id. */
-export const ROUTER_SESSION_ID = 'mesh-router'
+/**
+ * The Router Session id for an Engine's scope.
+ *
+ * Derived rather than fixed: DSH resolves a Session by id alone and allows one active
+ * writer, so a hardcoded id would make a second workspace fail to start with
+ * `session/writer-held`.
+ */
+function routerIdOf(engine: Engine): string {
+  return routerSessionId(engine.scope === '' ? 'legacy' : engine.scope)
+}
 
 /** Plugin config. */
 export interface Config {
+  /**
+   * Overrides the workspace-derived scope. Only set this to keep an existing instance's
+   * ids stable; normally leave it unset so the workspace path decides.
+   */
+  scope?: string
   stateDir?: string
   pass?: { intervalMs?: number }
   executor?: { residentWorkers?: number; tempSlots?: number; prepareTimeoutMs?: number }
@@ -65,6 +79,7 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
+  scope: Schema.string().description('Overrides the workspace-derived id scope. Leave unset normally.'),
   stateDir: Schema.string().description('Directory holding the Mesh state database.'),
   pass: Schema.object({
     intervalMs: Schema.number().default(DEFAULT_PASS_INTERVAL_MS),
@@ -109,10 +124,14 @@ interface Runtime {
  * @param config - resolved plugin config.
  */
 export function apply(ctx: Context, config: Config): void {
-  const stateDir = resolveStateDir(config)
   const cwd = config.workspace ?? process.cwd()
+  // Every Session and worker id is namespaced by workspace, so several workspaces can
+  // each run their own team on one host. DSH resolves a Session by id alone and allows
+  // one active writer, so without this a second workspace gets `session/writer-held`.
+  const scope = config.scope ?? workspaceScope(cwd)
+  const stateDir = resolveStateDir(config, scope)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  traceStep(stateDir, 'apply')
+  traceStep(stateDir, `apply scope=${scope} workspace=${cwd}`)
 
   let runtime: Runtime | undefined
   let stopping = false
@@ -126,7 +145,7 @@ export function apply(ctx: Context, config: Config): void {
     // awaits below. A synchronous body completes immediately, and any later Host call
     // then throws "cannot get required service in inactive context".
     const host = injected as unknown as HostServices
-    const built = boot(injected, host, config, stateDir, cwd)
+    const built = boot(injected, host, config, stateDir, cwd, scope)
     runtime = built
     traceStep(stateDir, 'inject:booted')
 
@@ -186,7 +205,7 @@ export function apply(ctx: Context, config: Config): void {
           scheduleCtx,
           schedule,
           built.engine,
-          ROUTER_SESSION_ID,
+          routerIdOf(built.engine),
           config.watchdog?.everySeconds ?? 3600,
         )
         traceStep(stateDir, `watchdog:${handle.installed ? 'installed' : `skipped ${handle.reason}`}`)
@@ -246,12 +265,14 @@ function boot(
   config: Config,
   stateDir: string,
   cwd: string,
+  scope: string,
 ): Runtime {
   const store = new Store(join(stateDir, 'mesh.db'))
   const effects = new Effects(store)
   const engine = new Engine({
     store,
     effects,
+    scope,
     evalTimeoutMs: config.eval?.timeoutMs ?? 300_000,
     coalitionSoft: config.budget?.coalitionSoft ?? 0.8,
     inferredBlocking: config.coalitions?.inferredBlocking ?? false,
@@ -267,6 +288,7 @@ function boot(
       tempSlots: config.executor?.tempSlots ?? 2,
     },
     cwd,
+    scope,
   )
 
   const flushUsage = (): void => {
@@ -321,7 +343,7 @@ function registerEffectHandlers(
       engine.store.audit('program', 'assess.no-thread', { thread: payload.threadKey })
       return
     }
-    const router = sessions.get(ROUTER_SESSION_ID)
+    const router = sessions.get(routerIdOf(engine))
     if (!router) {
       engine.store.audit('program', 'assess.no-router', {})
       throw new Later('router session not ready')
@@ -342,7 +364,7 @@ function registerEffectHandlers(
       'is the ticket contract: goal, boundaries, acceptance, budget, and any mandatory gates.',
       'Pick the worker kind that fits: researcher, coder, reviewer, or ops.',
     ].join('\n')
-    await sessions.prompt(ROUTER_SESSION_ID, `assess:${key}`, card, 'steer')
+    await sessions.prompt(routerIdOf(engine), `assess:${key}`, card, 'steer')
     engine.assessmentDelivered(payload.threadKey)
     engine.store.audit('program', 'assess.delivered', { thread: payload.threadKey, eval: payload.evalId })
   })
@@ -424,18 +446,18 @@ function registerEffectHandlers(
 
   effects.handle(EFFECT.relay, { limit: 1, ordered: true }, async value => {
     const payload = value as { text: string }
-    const router = sessions.get(ROUTER_SESSION_ID)
+    const router = sessions.get(routerIdOf(engine))
     if (!router) throw new Later('router session not ready')
-    await sessions.prompt(ROUTER_SESSION_ID, `relay:${hash(payload.text)}`, payload.text, 'steer')
+    await sessions.prompt(routerIdOf(engine), `relay:${hash(payload.text)}`, payload.text, 'steer')
   })
 
   effects.handle(EFFECT.notice, { limit: 1, ordered: true }, async value => {
     const payload = value as { name: string; summary: string; value: unknown }
-    const router = sessions.get(ROUTER_SESSION_ID)
+    const router = sessions.get(routerIdOf(engine))
     if (!router) return
     // Inject rather than steer: a notice must not wake the Router or cost a turn.
     await sessions.prompt(
-      ROUTER_SESSION_ID,
+      routerIdOf(engine),
       `notice:${payload.name}:${hash(JSON.stringify(payload.value))}`,
       `${payload.summary}\n${JSON.stringify(payload.value)}`,
       { inject: payload.summary },
@@ -492,11 +514,12 @@ async function bringUp(
   const trace = (step: string): void => traceStep(runtime.stateDir, step)
   trace('bringUp:enter')
   try {
-    const router = await sessions.ensure(ROUTER_SESSION_ID, cwd, 'Mesh Router', 'router')
+    const routerId = routerIdOf(engine)
+    const router = await sessions.ensure(routerId, cwd, 'Mesh Router', 'router')
     sessions.applyPermission(router)
-    sessions.registerTools(router, routerTools({ engine, resources, routerSessionId: ROUTER_SESSION_ID }))
+    sessions.registerTools(router, routerTools({ engine, resources, routerSessionId: routerId }))
     engine.store.kvSet('router.prompt', ROUTER_PROMPT)
-    engine.store.audit('program', 'router.ready', { sessionId: ROUTER_SESSION_ID })
+    engine.store.audit('program', 'router.ready', { sessionId: routerId, scope: engine.scope })
     trace('bringUp:router-ready')
   } catch (error) {
     ctx.logger?.warn?.(`[mesh] router session unavailable: ${String(error)}`)
@@ -535,9 +558,11 @@ async function registerResident(
   kind: WorkerKind,
   cwd: string,
 ): Promise<void> {
-  const sessionId = residentSessionId(kind, 1)
+  // Both ids are minted by the Engine, which knows the workspace scope.
+  const workerId = engine.residentWorkerId(kind, 1)
+  const sessionId = workerId
   const worker: Worker = {
-    id: `mesh-${kind}-1`,
+    id: workerId,
     kind,
     sessionId,
     status: 'starting',
@@ -556,9 +581,15 @@ async function registerResident(
   void ctx
 }
 
-/** Resolve `stateDir`, expanding a leading `~` against the home directory. */
-function resolveStateDir(config: Config): string {
-  const raw = config.stateDir ?? join(homeDir(), '.dsh', 'state', 'mesh')
+/**
+ * Resolve `stateDir`, expanding a leading `~` against the home directory.
+ *
+ * The default is per-scope, so two workspaces never share a database. Sharing one would
+ * be worse than the id collision it replaces: the tickets, budgets, and audit trail of
+ * two teams would interleave in a single store with no way to tell them apart.
+ */
+function resolveStateDir(config: Config, scope: string): string {
+  const raw = config.stateDir ?? join(homeDir(), '.dsh', 'state', `mesh-${scope}`)
   if (raw === '~') return homeDir()
   if (raw.startsWith('~/') || raw.startsWith('~\\')) return join(homeDir(), raw.slice(2))
   return raw

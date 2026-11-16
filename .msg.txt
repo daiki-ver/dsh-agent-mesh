@@ -1,0 +1,44 @@
+feat: scope every Session and worker id by workspace
+
+Multiple workspaces can now each run their own Mesh team on one host, with no
+visibility between them. Before this, the second workspace could not start at
+all: ids were hardcoded (`mesh-router`, `mesh-coder-1`), DSH resolves a Session
+by id alone and allows one active writer per id, so the second instance failed
+with `session/writer-held` while the first held the name.
+
+Identity is now derived from the workspace path. `workspaceScope` hashes the
+normalised absolute path — separators and case folded, trailing separator
+ignored — so the scope is stable across restarts (a resumed Session is found
+again) and distinct per directory, while staying short enough to read inside an
+id: `mesh-yv5qr8-router`, `mesh-187b16q-coder-1`.
+
+Three things follow from that:
+
+- Session and worker ids carry the scope, so two teams never collide in DSH's
+  id space.
+- `stateDir` defaults to `mesh-<scope>`, so tickets, budgets, and audit rows of
+  two teams cannot interleave in one store. Sharing a store would have been
+  worse than the collision it replaces, because nothing in a row says which team
+  it belongs to.
+- `pickWorker` reads its own store, so a Router cannot discover a worker from
+  another workspace — there is no shared table to filter, which is the property
+  the user asked for.
+
+`scope` is configurable but should normally be left unset; it exists only to
+keep an existing instance's ids stable across an upgrade. An empty scope keeps
+the old flat ids, so a store created before this change still opens.
+
+Isolation is logical, not a security boundary, and the docs say so: a worker in
+one workspace cannot see or address another's workers, but its filesystem is
+only confined by its cwd, not by a sandbox. A coder that hardcodes another
+repo's absolute path can still read it.
+
+Verified with two instances running at once against dsh 0.2.2-rc.1:
+
+  A (DSH-AgentMesh):    mesh-yv5qr8-router / -researcher-1 / -coder-1
+  B (dsh-agent-mesh):   mesh-187b16q-router / -researcher-1 / -coder-1
+  state:                mesh-yv5qr8 / mesh-187b16q
+
+Each worker's Session recorded its own cwd, each `workers` endpoint listed only
+its own two workers, and a real task in each workspace completed in parallel.
+107 unit tests, including 11 that assert the isolation directly.

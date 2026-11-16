@@ -17,7 +17,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { Later } from '../core/effects.ts'
 import { type Assignment, type Ticket, type Worker, type WorkerKind } from '../core/model.ts'
-import { residentSessionId, tempSessionId, type HostServices } from '../app/host.ts'
+import type { HostServices } from '../app/host.ts'
 import type { SessionManager } from '../app/sessions.ts'
 
 /** Attempts before a delivery is treated as failed rather than transient. */
@@ -50,6 +50,8 @@ export class WorkerExecutor {
     private readonly host: HostServices,
     private readonly slots: SlotConfig,
     private readonly cwd: string,
+    /** Workspace scope, used only for diagnostics; ids come from the worker record. */
+    readonly scope = '',
   ) {}
 
   /** Free resident slots. */
@@ -81,9 +83,10 @@ export class WorkerExecutor {
     }
 
     try {
-      const sessionId = resident
-        ? residentSessionId(worker.kind, 1)
-        : tempSessionId(ticket.id)
+      // The worker record already carries its Session id, minted by the Engine with the
+      // workspace scope. Recomputing it here would be a second source of truth, and the
+      // two would drift the moment the naming rule changes.
+      const sessionId = worker.sessionId
       const session = await this.sessions.ensure(
         sessionId,
         this.cwd,

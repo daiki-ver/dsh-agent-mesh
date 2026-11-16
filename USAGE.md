@@ -253,3 +253,79 @@ Mesh 不做什么，说清楚比说做什么更有用：
 最后一条是认真的。这三个子系统代码写完了、测试覆盖了、能跑，但设计文档的判断是对的：它们占 v1 设计 70% 篇幅，却不是价值来源。价值在**类型化 worker**（researcher 不能写文件，ops 才有机器权限）和**预算可见**（每张票烧多少 token 一目了然）。
 
 现在就在 prompt 里引导 worker 用它们，等于自证需求。
+
+## 十、多工作区：每个工作区一个独立 team
+
+Mesh 支持多个工作区**同时运行**，每个工作区有自己的 Router 和 worker，互相看不到对方。
+
+### 原理
+
+每个实例的身份由工作区路径派生（`workspaceScope`），所有 Session 和 worker id 都带这个前缀：
+
+```
+D://CodeSpace//repo-a  →  mesh-yv5qr8-router / mesh-yv5qr8-coder-1
+D://CodeSpace//repo-b  →  mesh-187b16q-router / mesh-187b16q-coder-1
+状态库:                   ~/.dsh/state/mesh-yv5qr8 / ~/.dsh/state/mesh-187b16q
+```
+
+**为什么必须这样**：DSH 按 sessionId 定位会话，且同一 id 只允许一个写入句柄。如果 id 写死成 `mesh-router`，第二个工作区启动就会失败：
+
+```
+cannot resolve session mesh-router: session/writer-held
+```
+
+### 用法
+
+用 `workspace` 指定工作区，其余走默认：
+
+```bash
+# 工作区 A
+dsh --profile mesh --patch patch-a.yml --no-open --port 3251
+
+# 工作区 B（可同时运行）
+dsh --profile mesh --patch patch-b.yml --no-open --port 3252
+```
+
+`patch-a.yml` / `patch-b.yml`：
+
+```yaml
+- insert:
+    - id: mesh-engine
+      name: dsh-agent-mesh
+      config:
+        workspace: D://CodeSpace//repo-a
+        executor: { residentWorkers: 2, tempSlots: 2 }
+```
+
+**只需要改 `workspace`**，`stateDir` 和 `scope` 都会自动派生。
+
+### 隔离边界（实测确认）
+
+| 项 | 隔离 | 说明 |
+| --- | --- | --- |
+| Router 会话 | ✅ | 各自的 `mesh-<scope>-router` |
+| worker 会话 | ✅ | 各自的 `mesh-<scope>-<kind>-1` |
+| worker 列表 | ✅ | `mesh_tell` / `mesh_ask` 只查本实例的表，跨区不可见 |
+| 票与审计 | ✅ | 独立 SQLite 库，不是同一张表加过滤 |
+| 预算计量 | ✅ | 各记各的 |
+| 会话文件 | ✅ | 按 cwd 分目录存储 |
+| 文件系统 | ⚠️ | 各 worker 的 cwd 是自己的工作区，但**没有内核级沙箱隔离** —— 一个 coder 仍可读到别的工作区的绝对路径。要强隔离得靠 `permissionPresets` 或容器 |
+
+**最后一行是重点**：Mesh 的隔离是**逻辑隔离**（身份、状态、发现范围），不是**安全隔离**。A 的 worker 在 `mesh_tell` 里看不到 B 的 worker，但如果它硬编码 B 的绝对路径，文件系统层面是能读到的。
+
+如果你的场景需要"绝对不能读到别的仓库"，那需要在 DSH 层加沙箱策略，Mesh 本身不做这件事。
+
+### 什么时候不该开多个
+
+- **同一个仓库开两个 Mesh**：没有意义，两个 team 会抢同一批文件
+- **只是为了省钱**：每个常驻 worker 都是一条活会话，2 个工作区 × 2 常驻 = 4 条会话持续占内存
+
+### 清理
+
+```bash
+# 看有哪些工作区的状态
+ls ~/.dsh/state/ | grep mesh-
+
+# 删掉某个工作区的状态
+rm -rf ~/.dsh/state/mesh-<scope>
+```

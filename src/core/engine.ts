@@ -47,6 +47,12 @@ export const EFFECT = {
 export interface EngineOptions {
   store: Store
   effects: Effects
+  /**
+   * Workspace scope. Every Session and worker id this Engine mints is namespaced with
+   * it, so two workspaces' teams never collide in DSH's id space and never see each
+   * other's workers.
+   */
+  scope?: string
   evalTimeoutMs: number
   coalitionSoft: number
   inferredBlocking: boolean
@@ -73,11 +79,14 @@ export class Engine {
   readonly coalitions: Coalitions
   readonly budget: Budget
   readonly evals: Evals
+  /** Workspace scope for the ids this Engine mints. Empty means the legacy flat ids. */
+  readonly scope: string
   private readonly inferredBlocking: boolean
 
   constructor(options: EngineOptions) {
     this.store = options.store
     this.effects = options.effects
+    this.scope = options.scope ?? ''
     this.tickets = new Tickets(options.store)
     this.intake = new Intake(options.store, this.tickets)
     this.bus = new Bus(options.store)
@@ -640,7 +649,8 @@ export class Engine {
   pickWorker(kind: WorkerKind, ticketId?: string): Worker | undefined {
     if (kind === 'temp') {
       if (ticketId === undefined) return undefined
-      return this.createTempWorker(ticketId, 'temp', `mesh-temp-${ticketId}`)
+      const id = this.tempWorkerId(ticketId)
+      return this.createTempWorker(ticketId, 'temp', id)
     }
     const candidates = this.store.listWorkers().filter(w => w.kind === kind && w.status !== 'stopped')
     return candidates.find(w => w.status === 'idle') ?? candidates[0]
@@ -649,7 +659,7 @@ export class Engine {
   /** Create a temporary worker record for a per-ticket session. */
   createTempWorker(ticketId: string, kind: WorkerKind, sessionId: string): Worker {
     const worker: Worker = {
-      id: `mesh-temp-${ticketId}`,
+      id: this.tempWorkerId(ticketId),
       kind,
       sessionId,
       status: 'starting',
@@ -659,6 +669,21 @@ export class Engine {
       registeredAt: now(),
     }
     return this.registerWorker(worker)
+  }
+
+  /**
+   * Worker id for a per-ticket worker, namespaced by scope.
+   *
+   * The scope prefix is what keeps two workspaces' temp workers distinct: a ticket id is
+   * unique only within one store, so without it two teams would mint the same worker id.
+   */
+  tempWorkerId(ticketId: string): string {
+    return this.scope === '' ? `mesh-temp-${ticketId}` : `mesh-${this.scope}-temp-${ticketId}`
+  }
+
+  /** Worker id for a resident worker, namespaced by scope. */
+  residentWorkerId(kind: WorkerKind, seq = 1): string {
+    return this.scope === '' ? `mesh-${kind}-${seq}` : `mesh-${this.scope}-${kind}-${seq}`
   }
 
   // ── reads ────────────────────────────────────────────────────────────────

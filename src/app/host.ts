@@ -227,14 +227,60 @@ export const PRESET = {
   worker: 'mesh-worker',
 } as const
 
-/** Session id prefix for a resident worker. */
-export function residentSessionId(kind: string, seq = 1): string {
-  return `mesh-${kind}-${seq}`
+/**
+ * A workspace's short identity, used to namespace every Session and worker id.
+ *
+ * Two Mesh instances on one host must not collide: DSH resolves a Session by id alone
+ * and allows one active writer per id, so a second instance asking for `mesh-router`
+ * gets `session/writer-held` and never comes up. Namespacing by workspace gives each
+ * team its own names, so several teams coexist without seeing each other.
+ *
+ * The scope is a hash of the absolute workspace path: stable across restarts (so a
+ * resumed Session is found again), short enough to keep ids readable, and distinct per
+ * directory. It deliberately does not encode the path itself — ids travel in prompts
+ * and audit rows, where a full Windows path is noise.
+ *
+ * @param workspace - absolute workspace path.
+ */
+export function workspaceScope(workspace: string): string {
+  // Normalise separators and case so `D:\a\b` and `d:/a/b` are one workspace.
+  const normal = workspace.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  let h = 2166136261
+  for (let i = 0; i < normal.length; i += 1) {
+    h ^= normal.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(36)
+}
+
+/** Session id prefix for one workspace's team, e.g. `mesh-1a2b3c`. */
+export function scopePrefix(scope: string): string {
+  return `mesh-${scope}`
+}
+
+/** Session id for the Router of one workspace. */
+export function routerSessionId(scope: string): string {
+  return `${scopePrefix(scope)}-router`
+}
+
+/** Session id for a resident worker. */
+export function residentSessionId(scope: string, kind: string, seq = 1): string {
+  return `${scopePrefix(scope)}-${kind}-${seq}`
 }
 
 /** Session id for a per-ticket worker. */
-export function tempSessionId(ticketId: string): string {
-  return `mesh-temp-${ticketId}`
+export function tempSessionId(scope: string, ticketId: string): string {
+  return `${scopePrefix(scope)}-temp-${ticketId}`
+}
+
+/** Worker id for a resident worker. */
+export function residentWorkerId(scope: string, kind: string, seq = 1): string {
+  return residentSessionId(scope, kind, seq)
+}
+
+/** Worker id for a per-ticket worker. */
+export function tempWorkerId(scope: string, ticketId: string): string {
+  return tempSessionId(scope, ticketId)
 }
 
 /**
