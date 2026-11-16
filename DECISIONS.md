@@ -2,9 +2,45 @@
 
 > 你在休息，我把所有能自己判断的都做完了。这里只记**真正需要你拍板**的，每条都写了我的默认选择和理由，你回来只需看「要不要改」。
 
-## ⚠️ 唯一需要你动手的一件事：推送代码
+## ✅ 真实 LLM 端到端测试：已跑通（2026-11-16 上午）
 
-代码已完整提交到本地 `main`（commit `6b24c07`，39 个文件，18066 行），但**推送到 GitHub 失败**。
+用你本机的 `D:\Program Files\DSH`（0.2.2-rc.1）真实跑了两轮任务，**全链路验证成功**：
+
+```
+人提交任务 → Router 评估 → 建票 → 派给 researcher → worker 用 pwsh 读文件
+→ mesh_report 带回答案 → relay 送达 Router
+```
+
+**证据**（第二张票，`completed`）：
+
+```
+Ticket ... reported ready.
+Count: 13 .ts files under src/core
+Paths: src/core/budget.ts, bus.ts, coalitions.ts, directory.ts, effects.ts,
+       engine.ts, evals.ts, gates.ts, intake.ts, model.ts, passes.ts,
+       store.ts, tickets.ts
+Evidence: src/core EXISTS; it contains no subdirectories...
+```
+
+worker 真的用 pwsh 执行了 `Get-ChildItem`，答案带证据说明。
+
+**另外验证了 Router 的调度智能**：我提交「用一句话说明 1+1 等于几」，Router 判断这类问题不值得建票，直接自己回答并说明理由（"这类一句话即可回答的问题不需要派给 worker，否则会多花一个工单和预算"）。这是**正确行为**，不是 bug。
+
+**这轮测试暴露并修复了 5 个只有真跑才会发现的缺陷**（已 commit `0ffbef9`）：
+
+| 缺陷 | 后果 | 修复 |
+| --- | --- | --- |
+| `Engine.receive()` 无人调用 | 人的任务进不来 | 新增 `Engine.submit()` + `POST /mesh/api/task` |
+| HTTP 挂 `request` 事件与 Host 抢响应 | `ERR_HTTP_HEADERS_SENT` 直接崩进程 | 改用 `webServer.register()` 路由表 |
+| `prompt()` 缺 AbortSignal 参数 | 每次投递 TypeError，消息全丢 | 补 signal；`{inject}` 映射为 `queue` |
+| assess effect 重复开评估 | 拿到 undefined 直接 return，卡片从不投递 | 改为读 thread 后直接投递 |
+| worker 的答案从不回传 Router | 票结束了 Router 看不到内容，无限重问 | report 时 relay result 给 Router + assignment 消息里写明报告契约 |
+
+---
+
+## ⚠️ 需要你动手的一件事：推送代码
+
+代码已完整提交到本地 `main`（3 个 commit），但**推送到 GitHub 失败**。
 
 **原因**：`git config credential.helper = manager`，推送时 Git 要弹 GUI 凭据窗口，在非交互环境下阻塞超时。这是环境限制，不是代码问题。
 
@@ -19,7 +55,28 @@ git push -u origin main
 git push https://<你的token>@github.com/daiki-ver/dsh-agent-mesh.git main
 ```
 
-推完 `git log --oneline -1` 应看到 `6b24c07 feat: Mesh bundle — ...`。
+推完 `git log --oneline -1` 应看到 `0ffbef9 fix: make the end-to-end path actually work...`。
+
+---
+
+## 怎么自己再跑一次
+
+```bash
+cd D:/CodeSpace/DSH-AgentMesh/dsh-agent-mesh
+pnpm check                     # typecheck + 96 tests + build
+
+# 启动（用你本机的 dsh）
+"D:/Program Files/DSH/resources/runtime/cli/bin/dsh.cmd" --profile mesh --no-open --port 3227
+
+# 另一个终端：提交任务
+curl -X POST localhost:3227/mesh/api/task \
+  -H "content-type: application/json" \
+  -d '{"text":"在 src/core 里数一下有多少个 .ts 文件"}'
+
+# 看进度
+curl -s localhost:3227/mesh/api/tickets
+curl -s localhost:3227/mesh/api/health
+```
 
 ---
 
@@ -115,7 +172,7 @@ tool-todo:      { allowParallelInProgress: false }
 | --- | --- |
 | Router 的 `initializeRoleModel`（session-local 模型选型） | 需要 `ctx.llm` 的完整 API，而当前 profile 的 llm 服务可见性未验证。**目前所有 Session 用默认模型**，`eval.model` 配置项已留但未生效 |
 | web 前端的 Mesh 面板（可视化） | HTTP API 已完整（state/tickets/coalitions/usage/workers/gates/audit/health）。做 UI 是另一件事，且没有你的审美输入我不该猜 |
-| 真实的端到端 LLM 跑通（人→Router→worker→report） | 需要配置模型 API key 并发起真实对话。**这一步必须你来做**，因为涉及你的账号和额度 |
+| ~~真实的端到端 LLM 跑通~~ | ✅ **已完成**（见本文顶部），发现并修复 5 个缺陷 |
 | worker 崩溃后的 session 自动重建 | `Later` 机制已就位（投递失败会重试），但"session 被外部删除 → `sessions.ensure` 重建"这条路径没有实测，因为没法在不破坏环境的前提下模拟 |
 | 迁移（schema v1 → v2） | 首发只有 v1，`migrate()` 钩子已留 |
 
