@@ -1,11 +1,15 @@
 /**
- * The status API.
+ * The Mesh HTTP API.
  *
- * Read-only, and deliberately small. It exposes the two signals that tell an operator
- * what is actually wrong, which are easy to confuse:
+ * Mounted through the Host's route table rather than by listening on its `request`
+ * event: the Host owns that event for its own client, and two handlers writing one
+ * response throws `ERR_HTTP_HEADERS_SENT`, which takes the process down.
  *
- * - `pass.lastAt` — is the loop alive?
- * - `effect.waiting` — is work stuck behind a `Later`?
+ * The API is mostly read-only, and exposes the two signals that diagnose a stall, which
+ * are easy to confuse:
+ *
+ * - `pass.sinceLastPassMs` — is the loop alive?
+ * - `effects.waiting` — is work stuck behind a `Later`?
  *
  * If the loop is alive but effects are waiting, raising `pass.intervalMs` will not help;
  * the bottleneck is a busy slot or a busy target Session.
@@ -18,7 +22,7 @@ import type { Passes } from '../core/passes.ts'
 import type { WorkerExecutor } from '../executor/dsh.ts'
 import type { SessionManager } from './sessions.ts'
 
-/** What the status API reads. */
+/** What the API reads. */
 export interface StatusDeps {
   engine: Engine
   effects: Effects
@@ -27,55 +31,88 @@ export interface StatusDeps {
   sessions: SessionManager
 }
 
-/** A minimal request. Only the URL and method are used. */
+/** A minimal request. */
 interface RequestLike {
   url?: string
   method?: string
+  on?: (event: string, listener: (chunk?: unknown) => void) => void
+  body?: unknown
 }
 
 /** A minimal response. */
 interface ResponseLike {
   statusCode: number
+  headersSent?: boolean
+  writableEnded?: boolean
   setHeader(name: string, value: string): void
   end(body?: string): void
 }
 
-/** A minimal server surface. */
-interface ServerLike {
-  on(event: 'request', listener: (req: RequestLike, res: ResponseLike) => void): void
+/** The Host's route table. */
+interface WebServerLike {
+  register(route: {
+    kind: 'prefix' | 'exact'
+    path: string
+    handler: (req: RequestLike, res: ResponseLike) => void | Promise<void>
+  }): () => void
 }
 
-/** Register the status routes on a server, if the Host offers one. */
-export function registerStatusRoutes(server: ServerLike, deps: StatusDeps): void {
-  server.on('request', (req, res) => {
-    const url = req.url ?? '/'
-    if (!url.startsWith('/mesh/api/')) return
-    if (req.method !== undefined && req.method !== 'GET') {
-      res.statusCode = 405
-      res.end('method not allowed')
+/** The API's mount point. */
+export const API_PREFIX = '/mesh/api'
+
+/**
+ * Mount the API through the Host's route table.
+ *
+ * @param ctx - the injected context that owns `webServer`.
+ * @param deps - the runtime pieces the routes read.
+ * @returns whether the API was mounted.
+ */
+export function mountApi(ctx: Context, deps: StatusDeps): boolean {
+  const webServer = (ctx as unknown as Record<string, unknown>).webServer as WebServerLike | undefined
+  if (!webServer || typeof webServer.register !== 'function') return false
+  try {
+    webServer.register({
+      kind: 'prefix',
+      path: API_PREFIX,
+      handler: (req, res) => handle(req, res, deps),
+    })
+    ctx.logger?.info?.(`[mesh] status API mounted at ${API_PREFIX}/`)
+    return true
+  } catch (error) {
+    // A duplicate registration means another Mesh instance already owns the prefix.
+    ctx.logger?.warn?.(`[mesh] status API not mounted: ${String(error)}`)
+    return false
+  }
+}
+
+/** Route one request. */
+async function handle(req: RequestLike, res: ResponseLike, deps: StatusDeps): Promise<void> {
+  const url = req.url ?? '/'
+  try {
+    if (url.startsWith(`${API_PREFIX}/task`) && req.method === 'POST') {
+      await handleTask(req, res, deps)
       return
     }
-    try {
-      const body = route(url, deps)
-      res.statusCode = 200
-      res.setHeader('content-type', 'application/json; charset=utf-8')
-      res.setHeader('x-mesh-request', '1')
-      res.end(JSON.stringify(body, null, 2))
-    } catch (error) {
-      res.statusCode = 400
-      res.setHeader('content-type', 'application/json; charset=utf-8')
-      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+    if (req.method !== undefined && req.method !== 'GET') {
+      reply(res, 405, { error: 'method not allowed' })
+      return
     }
-  })
+    reply(res, 200, route(url, deps))
+  } catch (error) {
+    reply(res, 400, { error: error instanceof Error ? error.message : String(error) })
+  }
 }
 
-/** Resolve one route to its JSON body. */
+/** Resolve one GET route. */
 function route(url: string, deps: StatusDeps): unknown {
   const parsed = new URL(url, 'http://mesh.local')
-  switch (parsed.pathname) {
-    case '/mesh/api/state':
+  const path = parsed.pathname
+  switch (path) {
+    case `${API_PREFIX}/state`:
       return state(deps)
-    case '/mesh/api/tickets':
+    case `${API_PREFIX}/health`:
+      return health(deps)
+    case `${API_PREFIX}/tickets`:
       return deps.engine.store.listTickets(false).map(t => ({
         id: t.id,
         title: t.title,
@@ -85,32 +122,33 @@ function route(url: string, deps: StatusDeps): unknown {
         ended: t.ended?.outcome ?? null,
         assignments: t.assignments.length,
         gates: t.gates.length,
+        goal: t.spec.goal,
       }))
-    case '/mesh/api/coalitions':
+    case `${API_PREFIX}/coalitions`:
       return deps.engine.store.listCoalitions(false).map(c => ({
-        id: c.id,
-        topic: c.topic,
-        state: c.state,
-        mandate: c.mandate,
-        round: c.round,
-        budget: c.budget,
-        members: c.memberIds,
+        id: c.id, topic: c.topic, state: c.state, mandate: c.mandate,
+        round: c.round, budget: c.budget, members: c.memberIds,
       }))
-    case '/mesh/api/usage':
+    case `${API_PREFIX}/usage`:
       return deps.engine.store.listUsage({
         ...(parsed.searchParams.get('scope') ? { scope: parsed.searchParams.get('scope') as never } : {}),
         ...(parsed.searchParams.get('id') ? { scopeId: parsed.searchParams.get('id')! } : {}),
       })
-    case '/mesh/api/workers':
+    case `${API_PREFIX}/workers`:
       return deps.engine.store.listWorkers()
-    case '/mesh/api/gates':
+    case `${API_PREFIX}/gates`:
       return deps.engine.store.listGates(false)
-    case '/mesh/api/audit':
+    case `${API_PREFIX}/audit`:
       return deps.engine.store.listAudit(Number(parsed.searchParams.get('limit') ?? 100))
-    case '/mesh/api/health':
-      return health(deps)
+    case `${API_PREFIX}/evidence`:
+      return {
+        gate: deps.engine.evidence('gate.open', 3),
+        needs: deps.engine.evidence('needs.match', 5),
+        coalition: deps.engine.evidence('coalition.propose', 3),
+        escalate: deps.engine.evidence('escalate', 3),
+      }
     default:
-      throw new Error(`unknown route ${parsed.pathname}`)
+      throw new Error(`unknown route ${path}`)
   }
 }
 
@@ -136,39 +174,82 @@ function health(deps: StatusDeps): unknown {
   const waiting = effects.reduce((sum, h) => sum + h.waiting, 0)
   const errored = effects.reduce((sum, h) => sum + h.errored, 0)
   const sinceLast = deps.passes.sinceLastPassMs
+  const alive = sinceLast >= 0 && sinceLast < 30_000
   return {
-    pass: {
-      alive: sinceLast >= 0 && sinceLast < 30_000,
-      sinceLastPassMs: sinceLast,
-      error: deps.passes.error,
-    },
+    pass: { alive, sinceLastPassMs: sinceLast, error: deps.passes.error },
     effects: { waiting, errored, kinds: effects },
-    diagnosis: sinceLast >= 0 && sinceLast < 30_000 && waiting > 10
+    diagnosis: alive && waiting > 10
       ? 'the loop is alive but effects are waiting; check slots and busy targets, not the interval'
-      : sinceLast < 0 || sinceLast >= 30_000
+      : !alive
         ? 'the loop has not run recently; the interval or the process is the problem'
         : 'healthy',
   }
 }
 
 /**
- * Mount the status routes when the profile has a web server.
+ * Accept a task from a person.
  *
- * `webServer` is not a required service, and reaching for it from a context that never
- * declared it throws. A nested `inject` keeps it optional: a headless profile simply
- * never fires the callback.
+ * Body: `{ "text": "...", "thread": "optional-thread-key" }`. This is how work enters
+ * the mesh; every other route is read-only.
  */
-export function attachIfPossible(ctx: Context, deps: StatusDeps): void {
+async function handleTask(req: RequestLike, res: ResponseLike, deps: StatusDeps): Promise<void> {
   try {
-    ctx.inject(['webServer'], webCtx => {
-      const candidate = (webCtx as unknown as Record<string, unknown>).webServer as
-        { server?: ServerLike } | undefined
-      if (!candidate?.server) return
-      registerStatusRoutes(candidate.server, deps)
-      webCtx.logger?.info?.('[mesh] status API mounted at /mesh/api/')
+    const body = await readJson(req)
+    const text = typeof body.text === 'string' ? body.text.trim() : ''
+    if (text === '') throw new Error('"text" is required')
+    const thread = typeof body.thread === 'string' && body.thread !== '' ? body.thread : undefined
+    const result = deps.engine.submit(text, thread === undefined ? {} : { thread })
+    reply(res, 202, {
+      thread: result.thread,
+      disposition: result.intake.disposition,
+      assessed: result.assessment !== undefined,
+      ticketIds: result.intake.ticketIds,
     })
   } catch (error) {
-    // No web server in this profile: the status API is a convenience, not a dependency.
-    ctx.logger?.info?.(`[mesh] status API not mounted: ${String(error)}`)
+    reply(res, 400, { error: error instanceof Error ? error.message : String(error) })
   }
+}
+
+/** Write a response once. */
+function reply(res: ResponseLike, status: number, body: unknown): void {
+  if (res.headersSent || res.writableEnded) return
+  try {
+    res.statusCode = status
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.setHeader('x-mesh-request', '1')
+    res.end(JSON.stringify(body, null, 2))
+  } catch {
+    // The peer may already be gone; a status route must not take Mesh down.
+  }
+}
+
+/** Read and parse a JSON request body, with a size cap. */
+function readJson(req: RequestLike): Promise<Record<string, unknown>> {
+  if (typeof req.body === 'object' && req.body !== null) {
+    return Promise.resolve(req.body as Record<string, unknown>)
+  }
+  if (typeof req.on !== 'function') return Promise.resolve({})
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on?.('data', chunk => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+      size += buffer.length
+      if (size > 1_000_000) {
+        reject(new Error('request body too large'))
+        return
+      }
+      chunks.push(buffer)
+    })
+    req.on?.('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      if (raw.trim() === '') return resolve({})
+      try {
+        resolve(JSON.parse(raw) as Record<string, unknown>)
+      } catch (error) {
+        reject(new Error(`invalid JSON body: ${String(error)}`))
+      }
+    })
+    req.on?.('error', error => reject(error))
+  })
 }

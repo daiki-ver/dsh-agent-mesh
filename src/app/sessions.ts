@@ -140,6 +140,15 @@ export class SessionManager {
    *
    * @returns `true` when this call delivered, `false` when it was already delivered.
    */
+  /**
+   * Deliver text to a Session exactly once per request id.
+   *
+   * The Host's prompt surface accepts only `queue` and `steer`. An `inject` request is a
+   * notice that must not wake the agent; there is no such mode on the wire, so it is
+   * delivered as `queue` — the next turn sees it, and no turn is started for it.
+   *
+   * @returns `true` when this call delivered, `false` when it was already delivered.
+   */
   async prompt(
     sessionId: string,
     requestId: string,
@@ -151,23 +160,24 @@ export class SessionManager {
     if (session.delivered.has(requestId)) return false
 
     const controller = this.host.sessionController
-    if (typeof controller.prompt === 'function') {
-      await controller.prompt({
+    if (typeof controller.prompt !== 'function') {
+      throw new Error(`mesh: session ${sessionId} has no prompt surface on this Host`)
+    }
+    // `{inject}` has no wire form; queue is the non-waking equivalent.
+    const wireMode: 'queue' | 'steer' = mode === 'queue' || typeof mode === 'object' ? 'queue' : 'steer'
+    // The Host signature requires an AbortSignal and calls `throwIfAborted()` on it
+    // before admitting the prompt. Passing nothing throws a TypeError, which surfaces as
+    // a failed effect rather than a delivery, so always supply one.
+    const controller2 = new AbortController()
+    await controller.prompt(
+      {
         sessionId: sessionId as SessionId,
         requestId,
+        mode: wireMode,
         content: [{ type: 'text', text }],
-        mode,
-      })
-    } else {
-      // Fall back to the Agent's own inbox when the controller has no prompt surface.
-      const send = (session.agent as unknown as {
-        send?: (text: string, mode: PromptMode) => Promise<void> | void
-      }).send
-      if (typeof send !== 'function') {
-        throw new Error(`mesh: session ${sessionId} has no delivery surface`)
-      }
-      await send.call(session.agent, text, mode)
-    }
+      },
+      controller2.signal,
+    )
     session.delivered.add(requestId)
     return true
   }

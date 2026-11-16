@@ -37,7 +37,7 @@ import { SessionManager } from './app/sessions.ts'
 import { Resources } from './app/resources.ts'
 import { routerTools } from './app/tools/main.ts'
 import { workerTools } from './app/tools/executor.ts'
-import { attachIfPossible } from './app/http.ts'
+import { mountApi } from './app/http.ts'
 import { installWatchdog } from './app/watchdog.ts'
 import { ROUTER_PROMPT, workerPrompt } from './app/prompts.ts'
 import {
@@ -162,6 +162,18 @@ export function apply(ctx: Context, config: Config): void {
       traceStep(stateDir, `inject:bringUp-threw ${String(error)}`)
       throw error
     }
+
+    // The API mounts through the Host's route table, so it must happen inside a context
+    // that has declared `webServer`. A headless profile simply never fires this.
+    injected.inject(['webServer'], webCtx => {
+      mountApi(webCtx, {
+        engine: built.engine,
+        effects: built.effects,
+        passes: built.passes,
+        executor: built.executor,
+        sessions: built.sessions,
+      })
+    })
 
     // The Watchdog needs `schedule`, which is not in the required set: a profile without
     // it should still run Mesh. A nested inject keeps it optional without touching
@@ -300,17 +312,39 @@ function registerEffectHandlers(
 ): void {
   effects.handle(EFFECT.assess, { limit: 1, ordered: true }, async (value, key) => {
     const payload = value as { threadKey: string; evalId: string }
-    const candidate = engine.assess(payload.threadKey)
-    if (!candidate) return
+    engine.store.audit('program', 'assess.enter', { thread: payload.threadKey, key })
+    // The evaluation was already opened by whichever command enqueued this effect, so
+    // re-opening it here would return undefined and silently drop the card. Read the
+    // thread instead and deliver it.
+    const thread = engine.store.getThread(payload.threadKey)
+    if (!thread) {
+      engine.store.audit('program', 'assess.no-thread', { thread: payload.threadKey })
+      return
+    }
     const router = sessions.get(ROUTER_SESSION_ID)
-    if (!router) throw new Later('router session not ready')
+    if (!router) {
+      engine.store.audit('program', 'assess.no-router', {})
+      throw new Later('router session not ready')
+    }
+    // The card must carry the person's actual words. A Router told only "there is a
+    // candidate on thread X" has to spend a turn reading it back, and the whole point of
+    // the slow channel is that this decision happens once.
+    const quoted = thread.correlated
+      .map(id => engine.store.kvGet(`intake.text.${id}`) ?? '')
+      .filter(text => text !== '')
+      .join('\n---\n')
     const card = [
-      `Candidate on thread ${payload.threadKey}.`,
-      `Decide with mesh_route or mesh_eval_decide.`,
-      `Read the thread with mesh_read resource "thread/${payload.threadKey}".`,
+      `A person asked for work on thread ${payload.threadKey}.`,
+      '',
+      quoted === '' ? `(read it with mesh_read resource "thread/${payload.threadKey}")` : quoted,
+      '',
+      'Decide with mesh_route (accept / ignore / stop). If you accept, the spec you write',
+      'is the ticket contract: goal, boundaries, acceptance, budget, and any mandatory gates.',
+      'Pick the worker kind that fits: researcher, coder, reviewer, or ops.',
     ].join('\n')
     await sessions.prompt(ROUTER_SESSION_ID, `assess:${key}`, card, 'steer')
     engine.assessmentDelivered(payload.threadKey)
+    engine.store.audit('program', 'assess.delivered', { thread: payload.threadKey, eval: payload.evalId })
   })
 
   effects.handle(EFFECT.launch, { limit: 4 }, async value => {
@@ -322,6 +356,23 @@ function registerEffectHandlers(
     const previous = engine.store.kvGet(`worker.lastTicket.${worker.id}`)
     const text = assignmentMessage(ticket, worker.kind, reorientationNote(previous ?? undefined))
     await executor.launch(ticket, assignment, worker, text)
+
+    // A temporary worker's Session is created at launch, so it needs its tools and its
+    // prompt here — a resident worker got them once at startup. Without this a temp
+    // worker has no `mesh_report` and can never hand its work back.
+    if (!worker.resident) {
+      const session = sessions.get(worker.sessionId)
+      if (session) {
+        sessions.applyPermission(session, worker.kind)
+        sessions.registerTools(session, workerTools({
+          engine,
+          resources,
+          workerId: worker.id,
+          ticketId: ticket.id,
+        }))
+      }
+    }
+
     engine.store.kvSet(`worker.lastTicket.${worker.id}`, ticket.title)
     engine.setWorkerStatus(worker.id, 'busy', ticket.id)
     engine.tickets.startAssignment(ticket.id, assignment.id)
@@ -468,14 +519,8 @@ async function bringUp(
   // Watchdog is installed by `apply` through a nested inject, because `schedule` is
   // optional and must not be reachable from a context that never declared it.
 
-  // Status routes, when this profile has a web server.
-  attachIfPossible(ctx, {
-    engine,
-    effects: runtime.effects,
-    passes: runtime.passes,
-    executor: runtime.executor,
-    sessions,
-  })
+  // The Watchdog is installed by `apply` through a nested inject, because `schedule` is
+  // optional and must not be reachable from a context that never declared it.
 
   runtime.passes.request()
 }

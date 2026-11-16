@@ -128,6 +128,44 @@ export class Engine {
     this.store.atomic(() => this.evals.delivered(threadKey))
   }
 
+  /**
+   * A person submits a task to the mesh.
+   *
+   * This is the inbound entry point for human work. It takes the message in, and when
+   * nothing claimed it directly it queues a Router assessment — because a new task with
+   * no subscriber is exactly the case the slow channel exists for.
+   *
+   * @param text - what the person asked for.
+   * @param options - an explicit thread key, so follow-ups land on the same thread.
+   * @returns the intake result and whether an assessment was queued.
+   */
+  submit(text: string, options: { thread?: string; id?: string } = {}): {
+    intake: IntakeResult
+    assessment: Candidate | undefined
+    thread: string
+  } {
+    const id = options.id ?? newId('human')
+    const thread = options.thread ?? `thread:${id}`
+    const intake = this.receive({
+      id,
+      text,
+      human: true,
+      from: 'human',
+      thread,
+    })
+    // Keep the person's words addressable: the assessment card quotes them, so the
+    // Router decides from the request itself rather than from a summary of it.
+    this.store.kvSet(`intake.text.${id}`, text)
+    // A directly-delivered message already reached its worker; anything else needs the
+    // Router to decide what it is for.
+    const assessment = intake.disposition === 'delivered' ? undefined : this.assess(thread)
+    this.store.audit('human', 'task.submit', {
+      id, thread, disposition: intake.disposition, assessed: assessment !== undefined,
+      chars: text.length,
+    })
+    return { intake, assessment, thread }
+  }
+
   // ── tickets ──────────────────────────────────────────────────────────────
 
   /** Create a ticket and assign it, all in one transaction. */
@@ -140,9 +178,21 @@ export class Engine {
         ...(origin.thread === undefined ? {} : { thread: origin.thread }),
         ...(origin.triggerIds === undefined ? {} : { triggerIds: origin.triggerIds }),
       })
-      const worker = this.pickWorker(spec.workerKind)
+      const worker = this.pickWorker(spec.workerKind, ticket.id)
       if (!worker) {
+        // Nothing can take this. Say so loudly rather than leaving the ticket sitting in
+        // `waiting` with no explanation — a silent stall is the worst failure mode here.
         this.store.audit('program', 'ticket.unassigned', { ticket: ticket.id, kind: spec.workerKind })
+        this.effects.enqueue(EFFECT.notice, `unassigned:${ticket.id}`, {
+          name: `ticket:${ticket.id}`,
+          summary: `No worker for kind "${spec.workerKind}" — ticket ${ticket.id} is waiting`,
+          value: {
+            ticketId: ticket.id,
+            requestedKind: spec.workerKind,
+            available: this.store.listWorkers().map(w => `${w.id}(${w.kind})`),
+            hint: 'Retry with mesh_ticket_retry after a matching worker exists, or reassign the kind.',
+          },
+        })
         return { ticket }
       }
       const assigned = this.tickets.assign(ticket.id, worker.id)
@@ -169,6 +219,19 @@ export class Engine {
   report(ticketId: string, report: WorkerReport): Ticket {
     const ticket = this.store.atomic(() => {
       const updated = this.tickets.report(ticketId, report)
+      // A worker's answer must reach the Router. A worker's closing message stays in its
+      // own Session, so without this the Router sees a ticket end with no content and
+      // asks again — which is exactly the loop this relay prevents.
+      if (report.state === 'ready' || report.state === 'dropped') {
+        const answer = report.result ?? report.text
+        this.effects.enqueue(EFFECT.relay, `report:${ticketId}:${report.state}`, {
+          text: [
+            `Ticket ${ticketId} reported ${report.state}.`,
+            answer === '' ? '(the worker gave no result text)' : answer,
+            updated.ended === undefined ? '' : `Outcome: ${updated.ended.outcome}.`,
+          ].filter(line => line !== '').join('\n\n'),
+        })
+      }
       if (report.state === 'blocked' || report.state === 'failed' || updated.ended) {
         // Surface it to the person without waking the Router.
         this.effects.enqueue(EFFECT.notice, `ticket:${ticketId}:${report.state}`, {
@@ -567,8 +630,18 @@ export class Engine {
     })
   }
 
-  /** Pick a worker for a kind: an idle one first, then any live one. */
-  pickWorker(kind: WorkerKind): Worker | undefined {
+  /**
+   * Pick a worker for a kind: an idle one first, then any live one.
+   *
+   * `temp` is a per-ticket worker with no standing record, so it is created on demand
+   * rather than looked up. Without this a Router that picks `temp` for a one-off task
+   * would get a ticket that can never be assigned.
+   */
+  pickWorker(kind: WorkerKind, ticketId?: string): Worker | undefined {
+    if (kind === 'temp') {
+      if (ticketId === undefined) return undefined
+      return this.createTempWorker(ticketId, 'temp', `mesh-temp-${ticketId}`)
+    }
     const candidates = this.store.listWorkers().filter(w => w.kind === kind && w.status !== 'stopped')
     return candidates.find(w => w.status === 'idle') ?? candidates[0]
   }

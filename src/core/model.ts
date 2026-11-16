@@ -98,6 +98,22 @@ export const DispatchArtifact = z.object({
 })
 export type DispatchArtifact = z.infer<typeof DispatchArtifact>
 
+/**
+ * The smallest ticket budget Mesh will honour.
+ *
+ * A Router asked to size a budget will sometimes answer with a number that cannot cover
+ * one turn — 200 tokens is a plausible-looking guess and a guaranteed false alarm. A
+ * budget is a brake, not a prediction, so a too-small one is worse than none: it stops
+ * work that would have finished. Anything below this floor is raised to it.
+ */
+export const MIN_TICKET_BUDGET = 50_000
+
+/** Raise a Router-supplied budget to at least {@link MIN_TICKET_BUDGET}. */
+export function floorBudget(tokens: number | undefined): number | undefined {
+  if (tokens === undefined) return undefined
+  return Math.max(tokens, MIN_TICKET_BUDGET)
+}
+
 /** One attempt at a ticket. Retrying a ticket appends an assignment; it never mutates one. */
 export const Assignment = z.object({
   id: z.string().min(1),

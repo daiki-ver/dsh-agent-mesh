@@ -14,7 +14,7 @@
 
 import { z } from 'zod'
 import type { Engine } from '../../core/engine.ts'
-import { DispatchArtifact, GateSpec, RoundScriptStep, WorkerKind } from '../../core/model.ts'
+import { DispatchArtifact, GateSpec, RoundScriptStep, WorkerKind, floorBudget } from '../../core/model.ts'
 import type { Resources } from '../resources.ts'
 import { tool, NoArgs } from './tool.ts'
 
@@ -85,7 +85,14 @@ export function routerTools(deps: RouterToolDeps) {
         for (const item of args.items) {
           try {
             if (item.action === 'accept') {
-              const created = engine.create(item.spec, item.spec.budget ? 'explicit' : 'inferred', {
+              // A Router asked to size a budget often answers with a number too small to
+              // cover one turn. Raise it: a budget that stops work which would have
+              // finished is worse than no budget.
+              const floored = floorBudget(item.spec.budget?.tokens)
+              const spec = floored === undefined
+                ? item.spec
+                : { ...item.spec, budget: { tokens: floored } }
+              const created = engine.create(spec, item.spec.budget ? 'explicit' : 'inferred', {
                 human: true,
                 ...(item.thread === undefined ? {} : { thread: item.thread }),
                 triggerIds: item.triggerIds,

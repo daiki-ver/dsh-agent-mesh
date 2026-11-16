@@ -160,7 +160,14 @@ export class WorkerExecutor {
   }
 }
 
-/** Format the first message a worker receives for a ticket. */
+/**
+ * Format the first message a worker receives for a ticket.
+ *
+ * This message carries the whole reporting contract, not a pointer to it. A worker told
+ * only "report when done" will often answer in its closing message and stop, and that
+ * message never leaves its own Session — the ticket then sits in `working` forever. The
+ * instruction has to be explicit about where the deliverable goes.
+ */
 export function assignmentMessage(ticket: Ticket, kind: WorkerKind, reorientation: string): string {
   const spec = ticket.spec
   const lines = [
@@ -181,7 +188,21 @@ export function assignmentMessage(ticket: Ticket, kind: WorkerKind, reorientatio
     }
   }
   if (spec.routingNote) lines.push('', `Routing note: ${spec.routingNote}`)
-  lines.push('', `You are a ${kind} worker. Report with mesh_report when done.`)
+  lines.push(
+    '',
+    `You are a ${kind} worker.`,
+    '',
+    '## How to finish — read this before you answer',
+    'Your closing message stays inside this Session and nobody outside sees it. The Router',
+    'only sees what `mesh_report` sends. So:',
+    '',
+    `1. Do the work.`,
+    `2. Call \`mesh_report\` with \`ticketId: "${ticket.id}"\`, \`state: "ready"\`, and put the`,
+    '   complete deliverable in `result` — the actual answer, not a summary of it.',
+    '3. Only then write your closing message.',
+    '',
+    'If you skip step 2, this ticket never completes and a person sees nothing.',
+  )
   if (reorientation) lines.push('', reorientation)
   return lines.join('\n')
 }

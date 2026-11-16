@@ -94,12 +94,15 @@ export interface SessionControllerService {
     agentPreset?: string
   }): Promise<{ sessionId?: SessionId; error?: { code: string; message?: string } }>
   rename(request: { sessionId: SessionId; title: string }): Promise<unknown>
-  prompt?(request: {
-    sessionId: SessionId
-    requestId: string
-    content: { type: 'text'; text: string }[]
-    mode?: PromptMode
-  }): Promise<unknown>
+  prompt?(
+    request: {
+      sessionId: SessionId
+      requestId: string
+      mode?: 'queue' | 'steer'
+      content: { type: 'text'; text: string }[]
+    },
+    signal?: AbortSignal,
+  ): Promise<unknown>
 }
 
 /** `ctx.permissionPresets`: the runtime permission dial. */

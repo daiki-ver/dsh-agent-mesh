@@ -50,14 +50,15 @@ export function workerTools(deps: WorkerToolDeps) {
 
     tool(
       'mesh_report',
-      'Report on your ticket. "progress" keeps working; "ready" finishes; "dropped" means out of '
-        + 'scope; "blocked" or "failed" parks the ticket for a person. This is your only state '
-        + 'channel, so use it rather than ending a turn silently.',
+      'Report on your ticket. Put the DELIVERABLE in "result": the Router only sees what '
+        + 'this tool sends, never your closing message, so an answer written only at the end '
+        + 'of your turn is lost. "progress" keeps working; "ready" finishes; "dropped" means '
+        + 'out of scope; "blocked" or "failed" parks the ticket for a person.',
       z.object({
         ticketId: z.string(),
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
-        text: z.string().default(''),
-        result: z.string().optional(),
+        text: z.string().default('').describe('Short status note, not the deliverable.'),
+        result: z.string().optional().describe('The deliverable itself, in full.'),
         humanAction: z.string().optional(),
         refs: z.array(z.string()).default([]),
       }),

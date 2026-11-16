@@ -302,9 +302,13 @@ describe('Engine: audit and evidence', () => {
       })
       const created = engine.create(spec(), 'explicit', { human: true })
       engine.escalate('mesh-coder-1', 'substantive', { ticketId: created.ticket.id, detail: 'two designs' })
-      const notice = engine.store.dueEffects(100).find(r => r.kind === 'notice')
-      expect(notice).toBeDefined()
-      expect(JSON.parse(notice!.value).value.target).toBe('mesh-reviewer-1')
+      // The escalate notice is the one whose payload names a target; other notices
+      // (a ticket ending, for example) are unrelated.
+      const notices = engine.store.dueEffects(100)
+        .filter(r => r.kind === 'notice')
+        .map(r => JSON.parse(r.value) as { value: { target?: string } })
+      const escalate = notices.find(n => n.value.target !== undefined)
+      expect(escalate?.value.target).toBe('mesh-reviewer-1')
     })
   })
 
@@ -318,8 +322,11 @@ describe('Engine: audit and evidence', () => {
       // The reviewer becomes a party by being assigned.
       engine.tickets.assign(created.ticket.id, 'mesh-reviewer-1')
       engine.escalate('mesh-coder-1', 'substantive', { ticketId: created.ticket.id })
-      const notice = engine.store.dueEffects(100).find(r => r.kind === 'notice')
-      expect(JSON.parse(notice!.value).value.target).toBe('human')
+      const notices = engine.store.dueEffects(100)
+        .filter(r => r.kind === 'notice')
+        .map(r => JSON.parse(r.value) as { value: { target?: string } })
+      const escalate = notices.find(n => n.value.target !== undefined)
+      expect(escalate?.value.target).toBe('human')
     })
   })
 })
@@ -346,5 +353,43 @@ describe('Gates: cycle detection', () => {
 
   it('exports GateRefused for callers that escalate on refusal', () => {
     expect(new GateRefused('depth', 'too deep').reason).toBe('depth')
+  })
+})
+
+describe('Engine: report relay', () => {
+  it('relays a ready report to the Router so its result is not lost', () => {
+    withEngine(engine => {
+      const created = engine.create(spec(), 'explicit', { human: true })
+      engine.report(created.ticket.id, {
+        state: 'ready',
+        text: 'status note',
+        result: 'the actual deliverable',
+        refs: [],
+      })
+      const relay = engine.store.dueEffects(100).find(r => r.kind === 'relay')
+      expect(relay).toBeDefined()
+      const payload = JSON.parse(relay!.value) as { text: string }
+      // The deliverable must be in the relayed text, not just a status line.
+      expect(payload.text).toContain('the actual deliverable')
+      expect(payload.text).toContain('reported ready')
+    })
+  })
+
+  it('relays a dropped report with its reason', () => {
+    withEngine(engine => {
+      const created = engine.create(spec(), 'inferred', { human: false })
+      engine.report(created.ticket.id, { state: 'dropped', text: 'out of scope', refs: [] })
+      const relay = engine.store.dueEffects(100).find(r => r.kind === 'relay')
+      expect(relay).toBeDefined()
+      expect(JSON.parse(relay!.value).text).toContain('out of scope')
+    })
+  })
+
+  it('does not relay a progress report, which would spam the Router', () => {
+    withEngine(engine => {
+      const created = engine.create(spec(), 'explicit', { human: true })
+      engine.report(created.ticket.id, { state: 'progress', text: 'still working', refs: [] })
+      expect(engine.store.dueEffects(100).find(r => r.kind === 'relay')).toBeUndefined()
+    })
   })
 })

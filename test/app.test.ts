@@ -4,7 +4,7 @@ import { workerPrompt, ROUTER_PROMPT, SHARED_PROMPT, ROLE_SECTIONS } from '../sr
 import { assignmentMessage, reorientationNote } from '../src/executor/dsh.ts'
 import { permissionFor } from '../src/app/sessions.ts'
 import { z } from 'zod'
-import type { DispatchArtifact } from '../src/core/model.ts'
+import { MIN_TICKET_BUDGET, floorBudget, type DispatchArtifact } from '../src/core/model.ts'
 
 function spec(overrides: Partial<DispatchArtifact> = {}): DispatchArtifact {
   return {
@@ -132,6 +132,12 @@ describe('assignment message', () => {
     expect(text).toContain('tests pass')
     expect(text).toContain('coder worker')
     expect(text).toContain('fresh start')
+    // The reporting contract must be spelled out, not implied: a worker that answers only
+    // in its closing message leaves the ticket stuck in `working` forever.
+    expect(text).toContain('mesh_report')
+    expect(text).toContain('ticketId: "t1"')
+    expect(text).toContain('result')
+    expect(text).toContain('never completes')
   })
 
   it('reports a first ticket honestly', () => {
@@ -157,5 +163,21 @@ describe('permissionFor', () => {
     expect(permissionFor('coder')).toBe('workspace-write')
     expect(permissionFor('temp')).toBe('workspace-write')
     expect(permissionFor('ops')).toBe('danger-full-access')
+  })
+})
+
+describe('budget floor', () => {
+  it('raises a Router budget too small to cover one turn', () => {
+    // A Router asked to size a budget will answer "200", which cannot pay for a single
+    // turn and would stop work that was about to finish.
+    expect(floorBudget(200)).toBe(MIN_TICKET_BUDGET)
+  })
+
+  it('leaves a workable budget alone', () => {
+    expect(floorBudget(200_000)).toBe(200_000)
+  })
+
+  it('passes absence through, so an unset budget stays unset', () => {
+    expect(floorBudget(undefined)).toBeUndefined()
   })
 })
