@@ -8,6 +8,28 @@ The Router decides what work exists and who gets it. Workers do the work in thei
 - **Deciding whether to adopt it?** Read [What each piece actually buys](#what-each-piece-actually-buys) and [Known limits](#known-limits) first.
 - **Changing the code?** Read [The five rules](#the-five-rules), then [ARCHITECTURE.md](ARCHITECTURE.md) for how it actually runs, then [Development](#development).
 
+## The documents
+
+Four documents for using and changing Mesh, and four for the design history behind it.
+
+| Document | Answers |
+| --- | --- |
+| [USAGE.md](USAGE.md) | How to start it, submit work, watch progress, diagnose a stall, configure it |
+| [README.md](README.md) | Why it is designed this way: the five rules, what each piece buys, six Host facts |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How it runs: state machine, effect queue, delivery path, deadlock rules |
+| [DECISIONS.md](DECISIONS.md) | What needs a person's judgement, and what is deliberately not built |
+
+The design record lives in [`docs/`](docs/). It predates the implementation and is kept because the *reasons* for the shape are there — including the mistakes, which are often the most useful part.
+
+| Document | Contains |
+| --- | --- |
+| [`docs/mesh-bundle-review.md`](docs/mesh-bundle-review.md) | The code-level review that found 13 problems, two of them blocking. **Read this first** if you wonder why something is the way it is |
+| [`docs/mesh-bundle-design.md`](docs/mesh-bundle-design.md) | The summary layer: six rulings and their justification |
+| [`docs/mesh-bundle-issues.md`](docs/mesh-bundle-issues.md) | The issue registry P1–P16: problem, evidence, decision, status |
+| [`docs/mesh-bundle-detailed-design.md`](docs/mesh-bundle-detailed-design.md) | The detailed design: schema, domain objects, milestone plan |
+
+One thing to know before reading them: they describe the design *as intended*, and a few details changed during implementation. Where they disagree with the code, the code and this README are right — the implementation is the record of what actually worked. The most notable divergence is in [DECISIONS.md](DECISIONS.md), which tracks what shipped versus what was planned.
+
 ## Why this exists
 
 Two things in DSH are individually good and jointly incomplete:
