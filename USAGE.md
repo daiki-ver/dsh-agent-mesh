@@ -14,15 +14,25 @@
 dsh web: http://127.0.0.1:3080/?token=xxxxx
 ```
 
-**这个地址就是 Mesh 的界面。** 用浏览器打开它，你会在左侧会话列表看到三个会话：
+**这个地址就是 Mesh 的界面。** 用浏览器打开它，你会在左侧会话列表看到三个会话。
+
+会话名带一个工作区前缀（`scope`），因为它由工作区路径派生，让多个工作区能各自跑一套 team 而不撞名：
 
 | 会话 | 角色 | 说明 |
 | --- | --- | --- |
-| `mesh-router` | Router | 调度面。它决定"这是什么活、派给谁"，自己不动手 |
-| `mesh-researcher-1` | 常驻 worker | 只读权限，负责调研、读代码、比较方案 |
-| `mesh-coder-1` | 常驻 worker | 可写权限，负责改文件、验证改动 |
+| `mesh-<scope>-router` | Router | 调度面。它决定"这是什么活、派给谁"，自己不动手 |
+| `mesh-<scope>-researcher-1` | 常驻 worker | 只读权限，负责调研、读代码、比较方案 |
+| `mesh-<scope>-coder-1` | 常驻 worker | 可写权限，负责改文件、验证改动 |
+
+`<scope>` 是工作区路径的短哈希，例如工作区 `D:\CodeSpace\DSH-AgentMesh` 对应 `mesh-yv5qr8-router`。**这个名字在重启后不变**，所以历史会话能接上。
 
 想换端口加 `--port 3099`，不想自动开浏览器加 `--no-open`。
+
+不想猜 scope 是什么，直接查：
+
+```bash
+curl -s localhost:3080/mesh/api/state | python -c "import json,sys;print([s['sessionId'] for s in json.load(sys.stdin)['sessions']])"
+```
 
 ## 二、交活给 Mesh
 
@@ -51,11 +61,11 @@ curl -X POST localhost:3080/mesh/api/task \
 
 ### 方式 B：直接在 Router 会话里说
 
-浏览器打开 Mesh 界面，点 `mesh-router` 会话，像平时聊天一样说你要什么。
+浏览器打开 Mesh 界面，点 `mesh-<scope>-router` 会话，像平时聊天一样说你要什么。
 
 Router 会自己决定：**建票派给 worker**，还是**自己直接回答**。实测中它判断"1+1 等于几"这种问题不值得花一张票，会直接答并说明理由——这是设计意图，不是偷懒。
 
-### 方式 C：`--profile mesh` 之后用 DSH 自己的界面
+### 方式 C：用 DSH 原生界面
 
 Mesh 界面本身就是标准 DSH 界面，工具、文件、审批都是原生的。
 
@@ -75,12 +85,48 @@ curl -s localhost:3080/mesh/api/usage
 curl -s localhost:3080/mesh/api/audit
 ```
 
+### 全部接口
+
+| 接口 | 方法 | 返回 |
+| --- | --- | --- |
+| `/mesh/api/state` | GET | 总览：票数、worker、会话、effect 健康、pass 状态 |
+| `/mesh/api/health` | GET | 两个卡死信号 + `diagnosis` 结论 |
+| `/mesh/api/tickets` | GET | 票列表（阶段、kind、mandate、gate 数、goal） |
+| `/mesh/api/workers` | GET | worker 记录 |
+| `/mesh/api/coalitions` | GET | 小群列表（轮次、预算） |
+| `/mesh/api/gates` | GET | 闸列表 |
+| `/mesh/api/usage` | GET | token 用量，可加 `?scope=` / `?id=` 过滤 |
+| `/mesh/api/audit` | GET | 审计流水，可加 `?limit=`（默认 100） |
+| `/mesh/api/evidence` | GET | 四个证据计数器（gate/needs/coalition/escalate 各被用了几次） |
+| `/mesh/api/task` | **POST** | 接受一个人提交的任务（唯一的写接口） |
+
 `/mesh/api/health` 的两个关键字段：
 
-- `pass.alive: true` — 调度循环在跑
+- `pass.sinceLastPassMs` — 上次心跳距今多少毫秒。小于 30000 算活着
 - `effects.waiting` — 有多少活卡在队列里
 
-**如果 `alive` 是 true 但 `waiting` 一直大于 10**，问题不在循环速度，在槽位或目标会话忙。调 `pass.intervalMs` 没用。
+**如果循环活着但 `waiting` 一直大于 10**，问题不在循环速度，在槽位或目标会话忙。调 `pass.intervalMs` 没用——这是这个接口存在的全部理由。
+
+### 两个最有用的查询
+
+**看谁在烧钱**（按 scope 分组看总量）：
+
+```bash
+curl -s "localhost:3080/mesh/api/usage" | python -c "
+import json,sys
+for u in json.load(sys.stdin):
+    total = u['inputTokens'] + u['outputTokens']
+    print(f\"{u['scope']:8} {u['scopeId'][:38]:38} {total:>8} tokens\")
+"
+```
+
+**看证据计数**（决定要不要启用 Needs/Gates/Coalitions）：
+
+```bash
+curl -s localhost:3080/mesh/api/evidence
+```
+
+返回形如 `{"gate":{"count":0,"threshold":3},...}`。**跑一两周再看这个**，不要凭感觉决定。
 
 ## 四、一次完整的活长什么样
 
@@ -126,20 +172,76 @@ error: profile "desktop" is managed exclusively by the Electron application
 
 两者可以**同时运行**，互不干扰（不同端口、不同状态目录）。实际用法就是：平时用桌面端干活，需要 Mesh 调度多 agent 时开一个 mesh 实例。
 
+## 五点五、工具速查
+
+你不需要记这些——Router 和 worker 自己会选。但**调试时知道有什么工具**能少走弯路。
+
+### Router 有 14 个工具，全是调度，没有 shell
+
+| 工具 | 干什么 |
+| --- | --- |
+| `mesh_read` | 读状态：tickets / ticket/&lt;id&gt; / thread/&lt;key&gt; / message/&lt;id&gt; / workers / coalitions / gates / usage / audit / state / directory / prompts / settings |
+| `mesh_route` | 核心。`accept` 建票（你写的 spec 就是合同）、`ignore` 丢弃、`stop` 终止。一次最多 20 条 |
+| `mesh_eval_read` | 读等待决策的候选 |
+| `mesh_eval_decide` | 决策候选：accept / ignore |
+| `mesh_ticket_status` | 问 worker 要进度 |
+| `mesh_ticket_note` | 给票上的 worker 发指导 |
+| `mesh_ticket_retry` | 重试已结束的票，沿用原会话 |
+| `mesh_thread_unsubscribe` | 停止把某个 thread 路由给票 |
+| `mesh_coalition_propose` | 组临时小群 |
+| `mesh_coalition_approve` | 批准小群启动 |
+| `mesh_gate_escalate_decide` | 裁决升级到人的闸 |
+| `mesh_settings_save` | 存设置覆盖 |
+| `mesh_prompts_save` | 存 prompt 覆盖（带 revision） |
+| `mesh_evidence` | 看四个子系统各被真实用了几次 |
+
+**Router 没有 shell、不能写文件、不能开 subagent。** 这不是缺功能，是设计——它每多一个工具，每次路由决策都要为它付 token。
+
+### Worker 有 11 个工具，全是干活或报告
+
+| 工具 | 干什么 |
+| --- | --- |
+| `mesh_read` | 读状态和票详情 |
+| `mesh_report` | **最重要的一个。`result` 字段装交付物本身** |
+| `mesh_ack` | 确认收到消息 |
+| `mesh_tell` | 给别的 worker 发单向消息 |
+| `mesh_ask` | 问别的 worker；`gate: true` 会让票停下等答复 |
+| `mesh_needs` | 声明缺某个专长（建议性，不阻塞） |
+| `mesh_publish` | 往主题广播短摘要 |
+| `mesh_subscribe` | 订阅主题 |
+| `mesh_gate_decide` | 裁决别人提给你的闸 |
+| `mesh_coalition_answer` | 回答小群的问题 |
+| `mesh_handback` | 交回票（超出授权范围时） |
+
+worker 的 shell、文件、搜索、压缩**来自 preset，不来自 Mesh**。
+
+### 调试时最常看的三条
+
+```bash
+# 1. Router 到底收到候选了吗
+curl -s localhost:3080/mesh/api/audit | grep -E "assess|eval"
+
+# 2. worker 到底报告了吗（没这条就说明卡在 working）
+curl -s localhost:3080/mesh/api/audit | grep "ticket.report"
+
+# 3. 派发出去了吗（没这条说明 pickWorker 找不到人）
+curl -s localhost:3080/mesh/api/audit | grep "ticket.assign"
+```
+
 ## 六、改代码之后
 
 ```bash
 cd D:/CodeSpace/DSH-AgentMesh/dsh-agent-mesh
 
 pnpm typecheck    # 类型检查
-pnpm test         # 96 个单测
+pnpm test         # 107 个单测
 pnpm build        # 构建到 lib/
 
 # 或者一次跑完
 pnpm check
 ```
 
-改完代码**必须重新 build**，因为 DSH 加载的是 `lib/index.mjs`，不是 `src/`。
+改完代码**必须重新 build**，因为 DSH 加载的是 `lib/index.mjs`，不是 `src/`。改了 TS 不 build，运行时行为一点不变——这是最容易浪费二十分钟的坑。
 
 想干净重测（清掉历史票和会话）：
 
@@ -218,24 +320,42 @@ out.split('\n').filter(Boolean).forEach(l=>{try{const e=JSON.parse(l);
 
 ## 八、常用配置
 
-改 `cordis.patch.yml` 里 `mesh-engine` 的 `config`：
+改 `cordis.patch.yml` 里 `mesh-engine` 的 `config`。全部字段带默认值：
 
 ```yaml
 - id: mesh-engine
   name: dsh-agent-mesh
   config:
-    stateDir: ~/.dsh/state/mesh
+    workspace: null            # 默认 process.cwd()；worker 会话的工作目录
+    scope: null                # 默认 hash(workspace)；只在想固定旧 id 时才设
+    stateDir: null             # 默认 ~/.dsh/state/mesh-<scope>
     pass:
-      intervalMs: 2000          # 调度心跳，2 秒
+      intervalMs: 2000         # 调度心跳；交互路径靠 kick 立即响应，不等心跳
     executor:
-      residentWorkers: 2        # 常驻 worker 数量（researcher + coder）
-      tempSlots: 2              # 临时 worker 并发上限
+      residentWorkers: 2       # 常驻 worker 数（researcher + coder），每个都占一条活会话
+      tempSlots: 2             # 临时 worker 并发上限
+      prepareTimeoutMs: 600000 # 一轮结束后残留的后台任务，超时被杀
     budget:
-      coalitionSoft: 0.8        # 小群预算用到 80% 时收敛
+      coalitionSoft: 0.8       # 小群预算用到 80% 时开始收敛
+    coalitions:
+      inferredBlocking: false  # 推断出的小群只通知，不阻塞
+    eval:
+      model: null              # 预留；目前所有会话都用 profile 默认模型
+      timeoutMs: 300000        # 候选超时未决策则重新排队
     watchdog:
       enabled: true
-      everySeconds: 3600        # 每小时巡检一次
+      everySeconds: 3600       # 每小时巡检一次
 ```
+
+三个不明显的点：
+
+**`workspace` 决定一切。** 它是 worker 的 cwd，也是 scope 的来源，还决定状态库路径。多工作区只需要设这一个字段。
+
+**两个槽位池，不是一个。** 常驻 worker 占的是保留槽，不跟票抢；所以加常驻不会减少能同时跑的票数。
+
+**`eval.model` 目前无效。** 字段留了但没接线，所有会话用 profile 默认模型。
+
+**票预算有 50000 token 下限。** Router 被要求给预算时常给出盖不住一轮的数字（200 这种看着合理、必然误报的数）。低于下限会被自动抬到 `MIN_TICKET_BUDGET`——刹车刹死了比没刹车更糟。
 
 改完要重新 build 才生效吗？**不用** —— `cordis.patch.yml` 是运行时读的，改完重启 `--profile mesh` 即可。
 

@@ -2,6 +2,19 @@
 
 > 你在休息，我把所有能自己判断的都做完了。这里只记**真正需要你拍板**的，每条都写了我的默认选择和理由，你回来只需看「要不要改」。
 
+## 文档导航
+
+四份文档，各管一件事，别混着看：
+
+| 文档 | 回答什么 | 什么时候读 |
+| --- | --- | --- |
+| [USAGE.md](USAGE.md) | **怎么用**。启动、交活、看进度、排障、配置 | 第一次用；忘了命令时 |
+| [README.md](README.md) | **为什么这样设计**。五条铁律、每个部件买什么、六条 Host 坑 | 决定要不要采用；改设计前 |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | **怎么运转的**。状态机、effect 队列、投递路径、死锁规则 | 改代码前；排查诡异行为时 |
+| 本文 | **需要你拍板什么**。七个决策点 + 我没做的事 | 现在 |
+
+---
+
 ## ✅ 真实 LLM 端到端测试：已跑通（2026-11-16 上午）
 
 用你本机的 `D:\Program Files\DSH`（0.2.2-rc.1）真实跑了两轮任务，**全链路验证成功**：
@@ -10,6 +23,7 @@
 人提交任务 → Router 评估 → 建票 → 派给 researcher → worker 用 pwsh 读文件
 → mesh_report 带回答案 → relay 送达 Router
 ```
+
 
 **证据**（第二张票，`completed`）：
 
@@ -132,13 +146,24 @@ tool-todo:      { allowParallelInProgress: false }
 
 ---
 
-## D4. 常驻 worker 数量（默认 2，不是 4）
+## D4. 常驻 worker 数量（默认 2，且**实际最多只能 2**）
 
 设计文档 v1 标了 4 个常驻（researcher/coder/reviewer/ops），但那与槽位数冲突，而且每个常驻都在持续付成本（session 存活 + 缓存预热 + Watchdog 巡检）。
 
 **默认 2 个**：researcher + coder。reviewer/ops 按需拉起。
 
-**要不要改**：如果你发现 reviewer 被调用得很频繁（看 `/mesh/api/usage`），把 `executor.residentWorkers` 改成 3 或 4 即可，槽位会自动让出。
+**⚠️ 一个我最初写错的地方，已核实修正**：`executor.residentWorkers` 调大到 3 或 4 **不会多起任何 worker**。因为启动逻辑是：
+
+```ts
+const residentKinds = WORKER_TEMPLATES.filter(t => t.resident).map(t => t.kind)
+const wanted = residentKinds.slice(0, config.executor?.residentWorkers ?? 2)
+```
+
+而 `WORKER_TEMPLATES` 里只有 `researcher` 和 `coder` 标了 `resident: true`，所以 `residentKinds` 长度恒为 2，`slice(0, 4)` 还是 2 个。
+
+**要让 reviewer/ops 也常驻**，需要在 `src/core/directory.ts` 里给它们加 `resident: true`，然后重新 build。这是个代码改动，不是配置改动。
+
+**要不要改**：如果你的场景里 reviewer 被频繁调用（看 `/mesh/api/usage` 里是否有大量 temp reviewer），再改代码。现在没必要。
 
 ---
 
@@ -166,15 +191,42 @@ tool-todo:      { allowParallelInProgress: false }
 
 ---
 
-## D7. 我没有做的事（明确记录）
+## D7. 多工作区隔离：已实现（原列为"不支持"，现已改）
+
+**你问的**：多个工作区能否各有独立 team、互不发现。
+
+**原来的答案**：不能。sessionId 硬编码为 `mesh-router`，DSH 按 id 定位且只允许一个写入句柄，第二个工作区启动直接失败（`session/writer-held`）。
+
+**现在的答案**：能。已实现并实测（commit `002eca3`）。
+
+```
+A (DSH-AgentMesh):     mesh-yv5qr8-router / -researcher-1 / -coder-1
+B (dsh-agent-mesh):    mesh-187b16q-router / -researcher-1 / -coder-1
+状态库:                 ~/.dsh/state/mesh-yv5qr8 / mesh-187b16q
+```
+
+三项实测确认：
+- 两个实例**同时运行**，无冲突
+- A 的 worker 表只有自己的 2 个，B 同理，**互相不可见**
+- 各自 worker 的 cwd 正确（A 读 `DSH-AgentMesh`，B 读 `dsh-agent-mesh`）
+
+**实现方式**：`workspaceScope()` 把工作区绝对路径归一化后哈希，得到短 scope，所有 sessionId / workerId / stateDir 都带这个前缀。
+
+**必须说清的边界**：这是**逻辑隔离**（身份、状态、发现范围），不是**安全隔离**。A 的 worker 在 `mesh_tell` 里看不到 B 的 worker，但文件系统层面没有内核沙箱——如果 A 的 coder 硬编码 B 仓库的绝对路径，它能读到。要强隔离得在 DSH 层加沙箱策略。
+
+---
+
+## D8. 我没有做的事（明确记录）
 
 | 没做 | 为什么 |
 | --- | --- |
 | Router 的 `initializeRoleModel`（session-local 模型选型） | 需要 `ctx.llm` 的完整 API，而当前 profile 的 llm 服务可见性未验证。**目前所有 Session 用默认模型**，`eval.model` 配置项已留但未生效 |
-| web 前端的 Mesh 面板（可视化） | HTTP API 已完整（state/tickets/coalitions/usage/workers/gates/audit/health）。做 UI 是另一件事，且没有你的审美输入我不该猜 |
+| web 前端的 Mesh 面板（可视化） | HTTP API 已完整（10 个路由）。做 UI 是另一件事，且没有你的审美输入我不该猜 |
 | ~~真实的端到端 LLM 跑通~~ | ✅ **已完成**（见本文顶部），发现并修复 5 个缺陷 |
+| ~~多工作区隔离~~ | ✅ **已完成**（见 D7），107 个单测含 11 个隔离断言 |
 | worker 崩溃后的 session 自动重建 | `Later` 机制已就位（投递失败会重试），但"session 被外部删除 → `sessions.ensure` 重建"这条路径没有实测，因为没法在不破坏环境的前提下模拟 |
 | 迁移（schema v1 → v2） | 首发只有 v1，`migrate()` 钩子已留 |
+| Gate / Coalition 的真实场景实测 | 代码写完、单测覆盖、能跑，但没在真实任务里触发过。**这是故意的**——按 D5 的判断，应该等 `mesh_evidence` 有真实计数再决定要不要引导使用 |
 
 ---
 
